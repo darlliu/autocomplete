@@ -11,9 +11,9 @@ def parse_json_like(fname):
             js = json.loads(line)
             if "queryInImp" not in js or "count" not in js: continue
             cnt = int(js["count"])
-            if cnt < 51: continue #only keep results with 5 searches
+            if cnt < 100: continue #only keep results with 10 searches
             s = js["queryInImp"]
-            if all(ord(_c) < 128 for _c in s):
+            if all(ord(_c) < 128 for _c in s) and s.strip()!="":
                 yield "/".join(filter(lambda s: s.strip() != "", s.lower().split())), int(js["count"])
             else: continue
 
@@ -35,14 +35,14 @@ if __name__ == "__main__":
     # lstmcnn -- keras lstm cnn with trained embedding layer
     # """)
     args = parser.parse_args()
-    tt = trie.StringTrie(sep="/")
+    tt = trie.StringTrie()
     cnt = 0 
     for q, c in parse_json_like(args.data):
         if q in tt:
             try:
                 tt[q] += c 
             except:
-                print("error setting " + tt[q])
+                print("error setting {} to with val {}".format(q, tt[q]))
                 tt[q] = c
         else:
             tt[q] = c
