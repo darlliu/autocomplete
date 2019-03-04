@@ -55,8 +55,11 @@ flags.DEFINE_string("vocab_file", "D:/data/uncased_L-12_H-768_A-12/vocab.txt",
                     "The vocabulary file that the BERT model was trained on.")
 
 flags.DEFINE_string(
-    "output_dir", "D:/data/output",
+    "output_dir", "D:/data/output/",
     "The output directory where the model checkpoints will be written.")
+
+flags.DEFINE_integer("samples", 125000,
+                     "Queries to collect.")
 
 # Other parameters
 
@@ -100,7 +103,7 @@ flags.DEFINE_float(
     "Proportion of training to perform linear learning rate warmup for. "
     "E.g., 0.1 = 10% of training.")
 
-flags.DEFINE_integer("save_checkpoints_steps", 1000,
+flags.DEFINE_integer("save_checkpoints_steps", 5000,
                      "How often to save the model checkpoint.")
 
 flags.DEFINE_integer("iterations_per_loop", 1000,
@@ -267,7 +270,7 @@ class AutoCompleteProcessor(DataProcessor):
     xs = []
     for cnt, example in enumerate(get_example()):
       xs.append(example)
-      if cnt > 10000:
+      if cnt > FLAGS.samples:
         break
     X_, self.tests = self.train_test_split(xs, 0.1)
     self.trains, self.devs = self.train_test_split(X_, 0.1)
@@ -1204,10 +1207,12 @@ def main(_):
     result = estimator.predict(input_fn=predict_input_fn)
     processor.evaluate([i for i in result], data = processor.tests)
     output_predict_file = os.path.join(FLAGS.output_dir, "test_results.tsv")
+    results = []
     with tf.gfile.GFile(output_predict_file, "w") as writer:
       num_written_lines = 0
       tf.logging.info("***** Predict results *****")
       for (i, prediction) in enumerate(result):
+        results.append(prediction)
         probabilities = prediction["probabilities"]
         if i >= num_actual_predict_examples:
           break
@@ -1216,7 +1221,7 @@ def main(_):
             for class_probability in probabilities) + "\n"
         writer.write(output_line)
         num_written_lines += 1
-    assert num_written_lines == num_actual_predict_examples
+    processor.evaluate(results, processor.tests)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import pygtrie as trie
 import string
 import os
 import random
+from tqdm import tqdm
 
 
 def parse_json_like(fname):
@@ -33,13 +34,13 @@ def get_example(allow_single=True, pft="./mytrie.gtrie"):
 
     allow_single to allow single word queries
     """
-    searched_queries = []
+    # searched_queries = []
     if os.path.exists(pft):
         tt = pkl.load(open(pft, "rb"))
         print("Loaded trie at {}".format(pft))
     else:
         raise IOError("Generate prefix trie first")
-    for query, query_cnt in tt.iteritems():
+    for query, query_cnt in tqdm(tt.iteritems(), "gen examples"):
         query = query.split("/")
         if len(query) < 2:
             if not allow_single:
@@ -49,15 +50,16 @@ def get_example(allow_single=True, pft="./mytrie.gtrie"):
             trimmed_query = query[:-1]
         trimmed_query = "/".join(trimmed_query)
         query = "/".join(query)
-        if trimmed_query in searched_queries:
-            continue
-        searched_queries.append(trimmed_query)
+        # if trimmed_query in searched_queries:
+        #     continue
+        # searched_queries.append(trimmed_query)
         outputs = []
         for q, c in tt.iteritems(prefix=trimmed_query):
             outputs.append((q, c))
         if len(outputs) < 2:
             continue
-        outputs = sorted(outputs, key=lambda x: -x[1])[:9]
+        # outputs = sorted(outputs, key=lambda x: -x[1])[:9]
+        outputs = outputs[:10]
         if query not in [i[0] for i in outputs]:
             outputs.append((query, query_cnt))
         random.shuffle(outputs)
@@ -71,20 +73,8 @@ if __name__ == "__main__":
      format")
     parser.add_argument("--trie", default="./mytrie.gtrie",
                         help="Path of processed prefix trie")
-    # parser.add_argument("--model", default="./models", help="Directory to output of models")
-    # parser.add_argument("--vocab-size", default=20000, type=int, help="Tokenizer vocabulary size")
-    # parser.add_argument("--tokenizer-mode", default="count", help="Tokenizer vectorization method")
-    # parser.add_argument("--batch", default=500, type=int, help="minibatch batch size")
-    # parser.add_argument("--epoch", default=1, type=int, help="Number of epochs")
     parser.add_argument("--debug", default=False,
                         action="store_true", help="Output debugging info")
-    # parser.add_argument("--mode", default="lr", help="""Mode of action:
-    # lr -- tensorflow linear classifiers, logistic regression
-    # lr2 -- tensorflow linear classifiers, logistic regression with weight decay + ftrl
-    # nn -- keras nn, 1 hidden layer, 1 dropout
-    # nn2 -- keras nn, 2 hidden layers, 1 dropout
-    # lstmcnn -- keras lstm cnn with trained embedding layer
-    # """)
     args = parser.parse_args()
     tt = trie.StringTrie()
     if os.path.exists(args.trie):
