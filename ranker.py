@@ -78,6 +78,8 @@ flags.DEFINE_integer(
     "Sequences longer than this will be truncated, and sequences shorter "
     "than this will be padded.")
 
+flags.DEFINE_bool("do_data", False, "Whether to generate tfrecord. `FLAGS.samples` is used.")
+
 flags.DEFINE_bool("do_train", False, "Whether to run training.")
 
 flags.DEFINE_bool("do_eval", False, "Whether to run eval on the dev set.")
@@ -135,11 +137,20 @@ flags.DEFINE_integer(
     "num_tpu_cores", 8,
     "Only used if `use_tpu` is True. Total number of TPU cores to use.")
 
+class InputGroup(object):
+  """
+  Simple object class for holding a query object.
+  """
+  def __init__(self, qid, examples, original, trimmed):
+    self.qid = qid
+    self.examples = examples
+    self.original = original
+    self.trimmed = trimmed
 
 class InputExample(object):
   """A single training/test example for simple sequence classification."""
 
-  def __init__(self, guid, text_a, text_b=None, label=None):
+  def __init__(self, guid, text_a, text_b=None, label=None, cnt=None):
     """Constructs a InputExample.
 
     Args:
@@ -155,6 +166,7 @@ class InputExample(object):
     self.text_a = text_a
     self.text_b = text_b
     self.label = label
+    self.cnt = cnt
 
 
 class PaddingInputExample(object):
@@ -215,65 +227,10 @@ class DataProcessor(object):
         lines.append(line)
       return lines
 
-
-class XnliProcessor(DataProcessor):
-  """Processor for the XNLI data set."""
-
-  def __init__(self):
-    self.language = "zh"
-
-  def get_train_examples(self, data_dir):
-    """See base class."""
-    lines = self._read_tsv(
-        os.path.join(data_dir, "multinli",
-                     "multinli.train.%s.tsv" % self.language))
-    examples = []
-    for (i, line) in enumerate(lines):
-      if i == 0:
-        continue
-      guid = "train-%d" % (i)
-      text_a = tokenization.convert_to_unicode(line[0])
-      text_b = tokenization.convert_to_unicode(line[1])
-      label = tokenization.convert_to_unicode(line[2])
-      if label == tokenization.convert_to_unicode("contradictory"):
-        label = tokenization.convert_to_unicode("contradiction")
-      examples.append(
-          InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
-    return examples
-
-  def get_dev_examples(self, data_dir):
-    """See base class."""
-    lines = self._read_tsv(os.path.join(data_dir, "xnli.dev.tsv"))
-    examples = []
-    for (i, line) in enumerate(lines):
-      if i == 0:
-        continue
-      guid = "dev-%d" % (i)
-      language = tokenization.convert_to_unicode(line[0])
-      if language != tokenization.convert_to_unicode(self.language):
-        continue
-      text_a = tokenization.convert_to_unicode(line[6])
-      text_b = tokenization.convert_to_unicode(line[7])
-      label = tokenization.convert_to_unicode(line[1])
-      examples.append(
-          InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
-    return examples
-
-  def get_labels(self):
-    """See base class."""
-    return ["contradiction", "entailment", "neutral"]
-
-
 class AutoCompleteProcessor(DataProcessor):
   def __init__(self, data_dir=FLAGS.data_dir):
     self.language = "en"
-    xs = []
-    for cnt, example in enumerate(get_example()):
-      xs.append(example)
-      if cnt > FLAGS.samples:
-        break
-    X_, self.tests = self.train_test_split(xs, 0.1)
-    self.trains, self.devs = self.train_test_split(X_, 0.1)
+    self.train_test_split()
 
   def evaluate(self, results, data = None):
     if data is None: data = self.devs
@@ -369,257 +326,65 @@ class AutoCompleteProcessor(DataProcessor):
     print("NDCG@3 {:.3f} static {:.3f} bert".format(scores["ndcg_static"]/sz1, scores["ndcg_pred"]/sz1))
     return
 
-  def train_test_split(self, X, test_size=0.1):
+  def train_test_split(self, test_size=0.1, dev_size=0.1):
     """
     implementation of train test split with shuffling and test portion
     data must be in memory
     """
     assert test_size < 1.0, "Splitting portion must be between 0 and 1.0, instead got {}".format(
         test_size)
-    idxs = list(range(0, len(X)))
+    idxs = list(range(0, FLAGS.samples))
     numpy.random.shuffle(idxs)
-    split_at = int(test_size*len(X))
+    split_at = int(test_size*len(idxs))
     idxs_l, idxs_r = idxs[split_at:], idxs[:split_at]
-    return [X[i] for i in idxs_l], [X[i] for i in idxs_r]
-
-  def get_train_examples(self, data_dir):
-    examples = []
-    for i, example in tqdm(enumerate(self.trains), "train data"):
-      guid="train-%d" % (i)
+    split_at2 = int(dev_size*len(idxs_l))
+    idxs_ll, idxs_lr = idxs_l[split_at2:], idxs_l[:split_at2]
+    self.trains = set(idxs_ll)
+    self.devs = set(idxs_lr)
+    self.tests = set(idxs_r)
+  
+  def __iter__(self):
+    for i, example in enumerate(get_example()):
       trimmed_query, (query, query_cnt), candidates = example
+      outputs = []
       for j, (q, qcnt)  in enumerate(candidates):
-        guid2 = guid  + ("-%d" % (j))
+        guid = "ex"  + ("-%d" % (j))
         if q == query:
           label = "click"
         else:
           label = "noclick"
         text_a=tokenization.convert_to_unicode(q.replace("/"," "))
         label=tokenization.convert_to_unicode(label)
-        examples.append(
-            InputExample(guid=guid2, text_a=text_a, label=label))
-    return examples
+        outputs.append(
+            InputExample(guid=guid, text_a=text_a, label=label, cnt=qcnt))
+      qid="q-%d" % (i)
+      output = InputGroup(qid, outputs, query, trimmed_query)
+      if i in self.trains:
+        yield 1, output
+      elif i in self.devs:
+        yield 2, output
+      elif i in self.tests:
+        yield 3, output
+      else:
+        break
+    
+  def __len__(self):
+    return len(self.trains) + len(self.devs) + len(self.tests)
+  
+  @property
+  def train_sz(self):
+    return len(self.trains)
 
-  def get_dev_examples(self, data_dir):
-    examples = []
-    for i, example in tqdm(enumerate(self.devs), "dev data"):
-      guid="dev-%d" % (i)
-      trimmed_query, (query, query_cnt), candidates = example
-      for j, (q, qcnt)  in enumerate(candidates):
-        guid2 = guid  + ("-%d" % (j))
-        if q == query:
-          label = "click"
-        else:
-          label = "noclick"
-        text_a=tokenization.convert_to_unicode(q.replace("/"," "))
-        label=tokenization.convert_to_unicode(label)
-        examples.append(
-            InputExample(guid=guid2, text_a=text_a, label=label))
-    return examples
+  @property
+  def dev_sz(self):
+    return len(self.devs)
 
-  def get_test_examples(self, data_dir):
-    examples = []
-    for i, example in tqdm(enumerate(self.tests), "test data"):
-      guid="test-%d" % (i)
-      trimmed_query, (query, query_cnt), candidates = example
-      for j, (q, qcnt)  in enumerate(candidates):
-        guid2 = guid  + ("-%d" % (j))
-        if q == query:
-          label = "click"
-        else:
-          label = "noclick"
-        text_a=tokenization.convert_to_unicode(q.replace("/"," "))
-        label=tokenization.convert_to_unicode(label)
-        examples.append(
-            InputExample(guid=guid2, text_a=text_a, label=label))
-    return examples
-
+  @property
+  def test_sz(self):
+    return len(self.tests)
+      
   def get_labels(self):
     return ["noclick", "click"]
-
-class QueryIntentionProcessor(DataProcessor):
-  def train_test_split(self, X, Y, test_size = 0.1):
-    """
-    implementation of train test split with shuffling and test portion
-    data must be in memory
-    """
-    assert len(X) == len(Y), "Data and label must have same size"
-    assert test_size < 1.0, "Splitting portion must be between 0 and 1.0, instead got {}".format(
-        test_size)
-    idxs= list(range(0, len(X)))
-    numpy.random.shuffle(idxs)
-    split_at= int(test_size*len(X))
-    idxs_l, idxs_r= idxs[split_at:], idxs[:split_at]
-    return X[idxs_l], X[idxs_r], Y[idxs_l], Y[idxs_r]
-
-  def __init__(self, data_dir =FLAGS.data_dir):
-    self.language="en"
-    lines= self._read_tsv(
-        os.path.join(data_dir, "intention.tsv"))
-    xs = numpy.array([x[0] for x in lines])
-    labels = numpy.array([x[1].lower() for x in lines])
-    X_, self.tests, Y_,  self.test_labels=self.train_test_split(xs, labels, 0.1)
-    self.trains, self.devs, self.train_labels, self.dev_labels =self.train_test_split(X_, Y_, 0.1)
-
-  def get_train_examples(self, data_dir):
-    examples = []
-    for i, (line, label) in enumerate(zip(self.trains, self.train_labels)):
-      if i == 0:
-        continue
-      guid = "train-%d" % (i)
-      text_a = tokenization.convert_to_unicode(line)
-      label = tokenization.convert_to_unicode(label)
-      examples.append(
-          InputExample(guid=guid, text_a=text_a, label=label))
-    return examples
-  
-  def get_dev_examples(self, data_dir):
-    examples = []
-    for i, (line, label) in enumerate(zip(self.devs, self.dev_labels)):
-      if i == 0:
-        continue
-      guid = "dev-%d" % (i)
-      text_a = tokenization.convert_to_unicode(line)
-      label = tokenization.convert_to_unicode(label)
-      examples.append(
-          InputExample(guid=guid, text_a=text_a, label=label))
-    return examples
-
-  def get_test_examples(self, data_dir):
-    examples = []
-    for i, (line, label) in enumerate(zip(self.tests, self.test_labels)):
-      if i == 0:
-        continue
-      guid = "test-%d" % (i)
-      text_a = tokenization.convert_to_unicode(line)
-      label = tokenization.convert_to_unicode(label)
-      examples.append(
-          InputExample(guid=guid, text_a=text_a, label=label))
-    return examples
-  
-  def get_labels(self):
-    return ["ambiguous", "company", "jobs", "oos", "people"]
-
-class MnliProcessor(DataProcessor):
-  """Processor for the MultiNLI data set (GLUE version)."""
-
-  def get_train_examples(self, data_dir):
-    """See base class."""
-    return self._create_examples(
-        self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
-
-  def get_dev_examples(self, data_dir):
-    """See base class."""
-    return self._create_examples(
-        self._read_tsv(os.path.join(data_dir, "dev_matched.tsv")),
-        "dev_matched")
-
-  def get_test_examples(self, data_dir):
-    """See base class."""
-    return self._create_examples(
-        self._read_tsv(os.path.join(data_dir, "test_matched.tsv")), "test")
-
-  def get_labels(self):
-    """See base class."""
-    return ["contradiction", "entailment", "neutral"]
-
-  def _create_examples(self, lines, set_type):
-    """Creates examples for the training and dev sets."""
-    examples = []
-    for (i, line) in enumerate(lines):
-      if i == 0:
-        continue
-      guid = "%s-%s" % (set_type, tokenization.convert_to_unicode(line[0]))
-      text_a = tokenization.convert_to_unicode(line[8])
-      text_b = tokenization.convert_to_unicode(line[9])
-      if set_type == "test":
-        label = "contradiction"
-      else:
-        label = tokenization.convert_to_unicode(line[-1])
-      examples.append(
-          InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
-    return examples
-
-
-class MrpcProcessor(DataProcessor):
-  """Processor for the MRPC data set (GLUE version)."""
-
-  def get_train_examples(self, data_dir):
-    """See base class."""
-    return self._create_examples(
-        self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
-
-  def get_dev_examples(self, data_dir):
-    """See base class."""
-    return self._create_examples(
-        self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
-
-  def get_test_examples(self, data_dir):
-    """See base class."""
-    return self._create_examples(
-        self._read_tsv(os.path.join(data_dir, "test.tsv")), "test")
-
-  def get_labels(self):
-    """See base class."""
-    return ["0", "1"]
-
-  def _create_examples(self, lines, set_type):
-    """Creates examples for the training and dev sets."""
-    examples = []
-    for (i, line) in enumerate(lines):
-      if i == 0:
-        continue
-      guid = "%s-%s" % (set_type, i)
-      text_a = tokenization.convert_to_unicode(line[3])
-      text_b = tokenization.convert_to_unicode(line[4])
-      if set_type == "test":
-        label = "0"
-      else:
-        label = tokenization.convert_to_unicode(line[0])
-      examples.append(
-          InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
-    return examples
-
-
-class ColaProcessor(DataProcessor):
-  """Processor for the CoLA data set (GLUE version)."""
-
-  def get_train_examples(self, data_dir):
-    """See base class."""
-    return self._create_examples(
-        self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
-
-  def get_dev_examples(self, data_dir):
-    """See base class."""
-    return self._create_examples(
-        self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
-
-  def get_test_examples(self, data_dir):
-    """See base class."""
-    return self._create_examples(
-        self._read_tsv(os.path.join(data_dir, "test.tsv")), "test")
-
-  def get_labels(self):
-    """See base class."""
-    return ["0", "1"]
-
-  def _create_examples(self, lines, set_type):
-    """Creates examples for the training and dev sets."""
-    examples = []
-    for (i, line) in enumerate(lines):
-      # Only the test set has a header
-      if set_type == "test" and i == 0:
-        continue
-      guid = "%s-%s" % (set_type, i)
-      if set_type == "test":
-        text_a = tokenization.convert_to_unicode(line[1])
-        label = "0"
-      else:
-        text_a = tokenization.convert_to_unicode(line[3])
-        label = tokenization.convert_to_unicode(line[1])
-      examples.append(
-          InputExample(guid=guid, text_a=text_a, text_b=None, label=label))
-    return examples
-
 
 def convert_single_example(ex_index, example, label_list, max_seq_length,
                            tokenizer):
@@ -724,34 +489,71 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
 
 
 def file_based_convert_examples_to_features(
-    examples, label_list, max_seq_length, tokenizer, output_file):
+    processor, label_list, max_seq_length, tokenizer, output_dir):
   """Convert a set of `InputExample`s to a TFRecord file."""
 
-  writer = tf.python_io.TFRecordWriter(output_file)
+  train_writer = tf.python_io.TFRecordWriter(os.path.join(output_dir, "train.tf_record"))
+  eval_writer = tf.python_io.TFRecordWriter(os.path.join(output_dir, "eval.tf_record"))
+  predict_writer = tf.python_io.TFRecordWriter(os.path.join(output_dir, "predict.tf_record"))
 
-  for (ex_index, example) in enumerate(examples):
+  for (ex_index, (which, query)) in enumerate(processor):
     if ex_index % 10000 == 0:
-      tf.logging.info("Writing example %d of %d" % (ex_index, len(examples)))
-
-    feature = convert_single_example(ex_index, example, label_list,
-                                     max_seq_length, tokenizer)
-
+      tf.logging.info("Writing example %d of %d" % (ex_index, FLAGS.samples))
+    
     def create_int_feature(values):
       f = tf.train.Feature(int64_list=tf.train.Int64List(value=list(values)))
       return f
+    
+    def create_string_feature(values):
+      f = tf.train.Feature(bytes_list = tf.train.BytesList(value = [values.encode("utf-8")]))
+      return f
+    
+    input_ids = []
+    input_mask = []
+    segment_ids = []
+    label_ids = []
+    is_real_example = []
+    qs = []
+    qcnt = []
+    for example in query.examples:
+      feature = convert_single_example(ex_index, example, label_list,
+                                      max_seq_length, tokenizer)
+      input_ids += [create_int_feature(feature.input_ids)]
+      input_mask += [create_int_feature(feature.input_mask)]
+      segment_ids += [create_int_feature(feature.segment_ids)]
+      label_ids += [create_int_feature([feature.label_id])]
+      is_real_example += [create_int_feature(
+          [int(feature.is_real_example)])]
+      qs += [create_string_feature(example.text_a)]
+      qcnt += [create_int_feature([example.cnt])]
+    context_features = collections.OrderedDict()
+    context_features["original"] = create_string_feature(query.original)
+    context_features["trimmed"] = create_string_feature(query.trimmed)
+    context_features["len"] = create_int_feature([len(query.examples)])
+    sequence_features = collections.OrderedDict()
+    sequence_features["input_ids"] = tf.train.FeatureList(feature = input_ids)
+    sequence_features["input_mask"] = tf.train.FeatureList(feature = input_mask)
+    sequence_features["segment_ids"] = tf.train.FeatureList(feature = segment_ids)
+    sequence_features["label_ids"] = tf.train.FeatureList(feature = label_ids)
+    sequence_features["is_real_example"] = tf.train.FeatureList(feature = is_real_example)
+    sequence_features["query"] = tf.train.FeatureList(feature = qs)
+    sequence_features["qcnt"] = tf.train.FeatureList(feature = qcnt)
+    tf_example = tf.train.SequenceExample(context = tf.train.Features(feature = context_features),
+      feature_lists=tf.train.FeatureLists(feature_list = sequence_features))
+    ss = tf_example.SerializeToString()
+    if len(ss) < 10: continue
+    if which == 1:
+      train_writer.write(ss)
+    elif which == 2:
+      eval_writer.write(ss)
+    elif which == 3:
+      predict_writer.write(ss)
+    else:
+      break
 
-    features = collections.OrderedDict()
-    features["input_ids"] = create_int_feature(feature.input_ids)
-    features["input_mask"] = create_int_feature(feature.input_mask)
-    features["segment_ids"] = create_int_feature(feature.segment_ids)
-    features["label_ids"] = create_int_feature([feature.label_id])
-    features["is_real_example"] = create_int_feature(
-        [int(feature.is_real_example)])
-
-    tf_example = tf.train.Example(features=tf.train.Features(feature=features))
-    writer.write(tf_example.SerializeToString())
-  writer.close()
-
+  train_writer.close()
+  eval_writer.close()
+  predict_writer.close()
 
 def file_based_input_fn_builder(input_file, seq_length, is_training,
                                 drop_remainder):
@@ -763,6 +565,24 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
       "segment_ids": tf.FixedLenFeature([seq_length], tf.int64),
       "label_ids": tf.FixedLenFeature([], tf.int64),
       "is_real_example": tf.FixedLenFeature([], tf.int64),
+      "query": tf.FixedLenFeature([], tf.string),
+      "qcnt": tf.FixedLenFeature([], tf.int64),
+  }
+
+  name_to_context_features = {
+    "original" : tf.FixedLenFeature([], tf.string),
+    "trimmed" : tf.FixedLenFeature([], tf.string),
+    "len" : tf.FixedLenFeature([], tf.int64)
+  }
+
+  name_to_sequence_features = {
+    "input_ids": tf.FixedLenSequenceFeature([seq_length], tf.int64),
+    "input_mask": tf.FixedLenSequenceFeature([seq_length], tf.int64),
+    "segment_ids": tf.FixedLenSequenceFeature([seq_length], tf.int64),
+    "label_ids": tf.FixedLenSequenceFeature([], tf.int64),
+    "is_real_example": tf.FixedLenSequenceFeature([], tf.int64),
+    "query": tf.FixedLenSequenceFeature([], tf.string),
+    "qcnt": tf.FixedLenSequenceFeature([], tf.int64),
   }
 
   def _decode_record(record, name_to_features):
@@ -779,23 +599,34 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
 
     return example
 
-  def input_fn(params):
-    """The actual input function."""
-    batch_size = params["batch_size"]
+  def _extract_examples(record): 
+    print(record)
+    print(record.__dict__)
+    context, sequence = tf.parse_single_sequence_example(record, 
+      context_features = name_to_context_features,
+      sequence_features = name_to_sequence_features)
+    print(context)
+    print(sequence)
+    leng = context["len"]
+    print(leng)
+    print(tf.unstack(leng))
+    return []
 
+  def input_fn(params):
+    batch_size = params["batch_size"]
     # For training, we want a lot of parallel reading and shuffling.
     # For eval, we want no shuffling and parallel reading doesn't matter.
     d = tf.data.TFRecordDataset(input_file)
-    if is_training:
-      d = d.repeat()
-      d = d.shuffle(buffer_size=100)
-
-    d = d.apply(
-        tf.contrib.data.map_and_batch(
-            lambda record: _decode_record(record, name_to_features),
-            batch_size=batch_size,
-            drop_remainder=drop_remainder))
-
+    d = d.map( _extract_examples )
+    # d = d.flat_map( lambda x: tf.data.Dataset().from_tensor_slices(x) )
+    # if is_training:
+    #   d = d.repeat()
+    #   d = d.shuffle(buffer_size=100)
+    # d = d.apply(
+    #     tf.contrib.data.map_and_batch(
+    #         lambda record: _decode_record(record, name_to_features),
+    #         batch_size=batch_size,
+    #         drop_remainder=drop_remainder))
     return d
 
   return input_fn
@@ -1031,20 +862,15 @@ def main(_):
   tf.logging.set_verbosity(tf.logging.INFO)
 
   processors = {
-      "cola": ColaProcessor,
-      "mnli": MnliProcessor,
-      "mrpc": MrpcProcessor,
-      "xnli": XnliProcessor,
-      "qi": QueryIntentionProcessor,
       "autocomplete": AutoCompleteProcessor,
   }
 
   tokenization.validate_case_matches_checkpoint(FLAGS.do_lower_case,
                                                 FLAGS.init_checkpoint)
 
-  if not FLAGS.do_train and not FLAGS.do_eval and not FLAGS.do_predict:
+  if not FLAGS.do_train and not FLAGS.do_eval and not FLAGS.do_predict and not FLAGS.do_data:
     raise ValueError(
-        "At least one of `do_train`, `do_eval` or `do_predict' must be True.")
+        "At least one of `do_data`, `do_train`, `do_eval` or `do_predict' must be True.")
 
   bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
 
@@ -1087,11 +913,6 @@ def main(_):
   train_examples = None
   num_train_steps = None
   num_warmup_steps = None
-  if FLAGS.do_train:
-    train_examples = processor.get_train_examples(FLAGS.data_dir)
-    num_train_steps = int(
-        len(train_examples) / FLAGS.train_batch_size * FLAGS.num_train_epochs)
-    num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
 
   model_fn = model_fn_builder(
       bert_config=bert_config,
@@ -1112,13 +933,62 @@ def main(_):
       train_batch_size=FLAGS.train_batch_size,
       eval_batch_size=FLAGS.eval_batch_size,
       predict_batch_size=FLAGS.predict_batch_size)
+  
+  if FLAGS.do_data:
+    file_based_convert_examples_to_features(
+        processor, label_list, FLAGS.max_seq_length, tokenizer, FLAGS.output_dir)
+    def _test_extract(record):
+      print(record, type(record))
+      seq_length = 128
+      name_to_context_features = {
+        "original" : tf.FixedLenFeature([], tf.string),
+        "trimmed" : tf.FixedLenFeature([], tf.string),
+        "len" : tf.FixedLenFeature([], tf.int64)
+      }
+
+      name_to_sequence_features = {
+        "input_ids": tf.FixedLenSequenceFeature([seq_length], tf.int64),
+        "input_mask": tf.FixedLenSequenceFeature([seq_length], tf.int64),
+        "segment_ids": tf.FixedLenSequenceFeature([seq_length], tf.int64),
+        "label_ids": tf.FixedLenSequenceFeature([], tf.int64),
+        "is_real_example": tf.FixedLenSequenceFeature([], tf.int64),
+        "query": tf.FixedLenSequenceFeature([], tf.string),
+        "qcnt": tf.FixedLenSequenceFeature([], tf.int64),
+      }
+
+      context, sequence = tf.parse_single_sequence_example(record, 
+        context_features = name_to_context_features,
+        sequence_features = name_to_sequence_features)
+      examples = []
+      for i in range(context["len"]):
+        example = {}
+        example["input_ids"] = sequence["input_ids"][i,:]
+        example["query"] = sequence["query"][i]
+      return examples
+    reader = tf.TFRecordReader()
+    filename_queue = tf.train.string_input_producer([os.path.join(FLAGS.output_dir, "train.tf_record")], num_epochs=1, shuffle=True)
+    key, record_string = reader.read(filename_queue)
+    data_record = _test_extract(record_string)
+    with tf.Session() as sess:
+      sess.run(
+          tf.variables_initializer(
+              tf.global_variables() + tf.local_variables()
+          )
+      )
+      # Start queue runners
+      coord = tf.train.Coordinator()
+      threads = tf.train.start_queue_runners(sess=sess, coord=coord)
+      examples = sess.run(data_record)
+      print(examples)
 
   if FLAGS.do_train:
+    train_examples_sz = processor.train_sz
+    num_train_steps = int(
+        train_examples_sz / FLAGS.train_batch_size * FLAGS.num_train_epochs)
+    num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
     train_file = os.path.join(FLAGS.output_dir, "train.tf_record")
-    file_based_convert_examples_to_features(
-        train_examples, label_list, FLAGS.max_seq_length, tokenizer, train_file)
     tf.logging.info("***** Running training *****")
-    tf.logging.info("  Num examples = %d", len(train_examples))
+    tf.logging.info("  Num examples = %d", train_examples_sz)
     tf.logging.info("  Batch size = %d", FLAGS.train_batch_size)
     tf.logging.info("  Num steps = %d", num_train_steps)
     train_input_fn = file_based_input_fn_builder(
@@ -1129,35 +999,15 @@ def main(_):
     estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
 
   if FLAGS.do_eval:
-    eval_examples = processor.get_dev_examples(FLAGS.data_dir)
-    num_actual_eval_examples = len(eval_examples)
-    if FLAGS.use_tpu:
-      # TPU requires a fixed batch size for all batches, therefore the number
-      # of examples must be a multiple of the batch size, or else examples
-      # will get dropped. So we pad with fake examples which are ignored
-      # later on. These do NOT count towards the metric (all tf.metrics
-      # support a per-instance weight, and these get a weight of 0.0).
-      while len(eval_examples) % FLAGS.eval_batch_size != 0:
-        eval_examples.append(PaddingInputExample())
-
+    eval_examples, num_actual_eval_examples = processor.get_dev_examples(FLAGS.data_dir)
     eval_file = os.path.join(FLAGS.output_dir, "eval.tf_record")
-    file_based_convert_examples_to_features(
-        eval_examples, label_list, FLAGS.max_seq_length, tokenizer, eval_file)
 
     tf.logging.info("***** Running evaluation *****")
-    tf.logging.info("  Num examples = %d (%d actual, %d padding)",
-                    len(eval_examples), num_actual_eval_examples,
-                    len(eval_examples) - num_actual_eval_examples)
     tf.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
 
     # This tells the estimator to run through the entire set.
     eval_steps = None
     # However, if running eval on the TPU, you will need to specify the
-    # number of steps.
-    if FLAGS.use_tpu:
-      assert len(eval_examples) % FLAGS.eval_batch_size == 0
-      eval_steps = int(len(eval_examples) // FLAGS.eval_batch_size)
-
     eval_drop_remainder = True if FLAGS.use_tpu else False
     eval_input_fn = file_based_input_fn_builder(
         input_file=eval_file,
@@ -1176,25 +1026,10 @@ def main(_):
         writer.write("%s = %s\n" % (key, str(result[key])))
 
   if FLAGS.do_predict:
-    predict_examples = processor.get_test_examples(FLAGS.data_dir)
-    num_actual_predict_examples = len(predict_examples)
-    if FLAGS.use_tpu:
-      # TPU requires a fixed batch size for all batches, therefore the number
-      # of examples must be a multiple of the batch size, or else examples
-      # will get dropped. So we pad with fake examples which are ignored
-      # later on.
-      while len(predict_examples) % FLAGS.predict_batch_size != 0:
-        predict_examples.append(PaddingInputExample())
-
+    predict_examples, num_actual_predict_examples = processor.get_test_examples(FLAGS.data_dir)
     predict_file = os.path.join(FLAGS.output_dir, "predict.tf_record")
-    file_based_convert_examples_to_features(predict_examples, label_list,
-                                            FLAGS.max_seq_length, tokenizer,
-                                            predict_file)
 
     tf.logging.info("***** Running prediction*****")
-    tf.logging.info("  Num examples = %d (%d actual, %d padding)",
-                    len(predict_examples), num_actual_predict_examples,
-                    len(predict_examples) - num_actual_predict_examples)
     tf.logging.info("  Batch size = %d", FLAGS.predict_batch_size)
 
     predict_drop_remainder = True if FLAGS.use_tpu else False

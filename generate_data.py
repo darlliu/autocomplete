@@ -34,7 +34,6 @@ def get_example(allow_single=True, pft="./mytrie.gtrie"):
 
     allow_single to allow single word queries
     """
-    # searched_queries = []
     if os.path.exists(pft):
         tt = pkl.load(open(pft, "rb"))
         print("Loaded trie at {}".format(pft))
@@ -47,21 +46,24 @@ def get_example(allow_single=True, pft="./mytrie.gtrie"):
                 continue
             trimmed_query = query
         else:
-            trimmed_query = query[:-1]
+            ridx = random.randint(1, len(query))
+            trimmed_query = query[:ridx]
         trimmed_query = "/".join(trimmed_query)
         query = "/".join(query)
-        # if trimmed_query in searched_queries:
-        #     continue
-        # searched_queries.append(trimmed_query)
         outputs = []
+        maxq, maxcnt = None, 0
         for q, c in tt.iteritems(prefix=trimmed_query):
             outputs.append((q, c))
+            if c > maxcnt:
+                maxq, maxcnt = q, c
         if len(outputs) < 2:
             continue
-        # outputs = sorted(outputs, key=lambda x: -x[1])[:9]
         outputs = outputs[:10]
-        if query not in [i[0] for i in outputs]:
+        output_names = [i[0] for i in outputs]
+        if query not in output_names:
             outputs.append((query, query_cnt))
+        if maxq not in output_names:
+            outputs.append((maxq, maxcnt))
         random.shuffle(outputs)
         yield trimmed_query, (query, query_cnt), outputs
 
