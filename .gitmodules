@@ -1,3 +1,6 @@
 [submodule "bert"]
 	path = bert
 	url = http://github.com/darlliu/bert.git
+[submodule "ranking"]
+	path = ranking
+	url = https://github.com/darlliu/ranking.git
