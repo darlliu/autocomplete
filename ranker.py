@@ -33,6 +33,16 @@ import numpy
 from ranking.tensorflow_ranking.python.data import parse_from_sequence_example
 from generate_data import get_example
 
+import six
+
+from tensorflow.python.framework import sparse_tensor
+from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import control_flow_ops
+from tensorflow.python.ops import math_ops
+from tensorflow.python.ops import parsing_ops
+from tensorflow.python.ops import sparse_ops
+from tensorflow.python.estimator.export import export as export_lib
+
 flags = tf.flags
 
 FLAGS = flags.FLAGS
@@ -88,11 +98,7 @@ flags.DEFINE_bool(
     "do_predict", False,
     "Whether to run the model in inference mode on the test set.")
 
-flags.DEFINE_integer("train_batch_size", 12, "Total batch size for training. Note: batch sizes are used for query level training.")
-
-flags.DEFINE_integer("eval_batch_size", 12, "Total batch size for eval. Note: batch sizes are used for query level training.")
-
-flags.DEFINE_integer("predict_batch_size", 12, "Total batch size for predict. Note: batch sizes are used for query level training.")
+flags.DEFINE_integer("batch_size", 12, "Total batch size for training. Note: batch sizes are used for query level training.")
 
 flags.DEFINE_float("learning_rate", 5e-5,
                    "The initial learning rate for Adam.")
@@ -500,19 +506,15 @@ def file_based_convert_examples_to_features(
   eval_writer.close()
   predict_writer.close()
 
-def file_based_input_fn_builder(input_file, seq_length, is_training,
-                                drop_remainder):
-  """Creates an `input_fn` closure to be passed to tf.Estimator"""
-
-
+def _extract_examples(record, list_size, seq_length): 
   name_to_features = {
-      "input_ids": tf.FixedLenFeature([seq_length], tf.int64),
-      "input_mask": tf.FixedLenFeature([seq_length], tf.int64),
-      "segment_ids": tf.FixedLenFeature([seq_length], tf.int64),
-      "label_ids": tf.FixedLenFeature([], tf.int64),
-      "is_real_example": tf.FixedLenFeature([], tf.int64),
-      "query": tf.FixedLenFeature([], tf.string),
-      "qcnt": tf.FixedLenFeature([], tf.int64),
+    "input_ids": tf.FixedLenFeature([seq_length], tf.int64),
+    "input_mask": tf.FixedLenFeature([seq_length], tf.int64),
+    "segment_ids": tf.FixedLenFeature([seq_length], tf.int64),
+    "label_ids": tf.FixedLenFeature([], tf.int64),
+    "is_real_example": tf.FixedLenFeature([], tf.int64),
+    "query": tf.FixedLenFeature([], tf.string),
+    "qcnt": tf.FixedLenFeature([], tf.int64),
   }
 
   name_to_context_features = {
@@ -530,24 +532,78 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
     "query": tf.FixedLenSequenceFeature([], tf.string),
     "qcnt": tf.FixedLenSequenceFeature([], tf.int64),
   }
+  context, examples = tf.io.parse_single_sequence_example(record, context_features = name_to_context_features,
+    sequence_features = name_to_sequence_features)
+  features = {}
+  features.update(context)
+  # Slice or pad example features to normalize the tensor shape:
+  # [batch_size, num_frames, ...] --> [batch_size, list_size, ...]
+  for k, t in six.iteritems(examples):
+      # Old shape: [batch_size, num_frames, ...]
+      shape = array_ops.unstack(array_ops.shape(t))
+      ndims = len(shape)
+      num_frames = shape[0]
+      # New shape: [batch_size, list_size, ...]
+      new_shape = [list_size] + shape[1:]
+      def slice_fn(t=t, ndims=ndims, new_shape=new_shape):
+          """Slices the tensor."""
+          if isinstance(t, sparse_tensor.SparseTensor):
+              return sparse_ops.sparse_slice(t, [0] * ndims,
+                                              math_ops.to_int64(new_shape))
+          else:
+              return array_ops.slice(t, [0] * ndims, new_shape)
 
-  def _extract_examples(record, batch_size): 
-    return parse_from_sequence_example(
-      record,
-      batch_size,
-      context_feature_spec=name_to_context_features,
-      example_feature_spec=name_to_sequence_features
-    )
+      def pad_fn(k=k,
+                  t=t,
+                  ndims=ndims,
+                  num_frames=num_frames,
+                  new_shape=new_shape):
+          """Pads the tensor."""
+          if isinstance(t, sparse_tensor.SparseTensor):
+              return sparse_ops.sparse_reset_shape(t, new_shape)
+          else:
+              # Padding is n * 2 tensor where n is the ndims or rank of the padded
+              # tensor.
+              if ndims == 2:
+                paddings = array_ops.stack([[0, list_size - num_frames, ],[0, 0]])
+              else:
+                paddings = array_ops.stack([[0, list_size - num_frames,] ])
+              default_val = tf.cast(0, tf.int64)
+              if name_to_sequence_features[k].dtype == tf.string:
+                default_val = ""
+              return array_ops.pad(
+                  t,
+                  paddings,
+                  constant_values=array_ops.squeeze(default_val)
+                  )
 
+      tensor = control_flow_ops.cond(
+          num_frames > list_size, slice_fn, pad_fn)
+      # Infer static shape for Tensor.
+      if not isinstance(tensor, sparse_tensor.SparseTensor):
+          static_shape = t.get_shape().as_list()
+          static_shape[0] = list_size
+          tensor.set_shape(static_shape)
+      features[k] = tensor
+  return features
+  # return parse_from_sequence_example(
+  #   record,
+  #   batch_size,
+  #   context_feature_spec=name_to_context_features,
+  #   example_feature_spec=name_to_sequence_features
+  # )
+
+def file_based_input_fn_builder(input_file, batch_size, seq_length, is_training,
+                                drop_remainder):
+  """Creates an `input_fn` closure to be passed to tf.Estimator"""
   def input_fn(params):
-    batch_size = params["batch_size"]
     # For training, we want a lot of parallel reading and shuffling.
     # For eval, we want no shuffling and parallel reading doesn't matter.
     d = tf.data.TFRecordDataset(input_file)
-    d = d.map( lambda x : _extract_examples(x, batch_size) )
     if is_training:
       d = d.repeat()
       d = d.shuffle(buffer_size=100)
+    d = d.map( lambda x : _extract_examples(x, batch_size, seq_length) )
     # do NOT batch afterwards since data is organized by query and in batch mode already
     return d
 
@@ -733,9 +789,10 @@ def main(_):
   tokenizer = tokenization.FullTokenizer(
       vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
 
-  train_examples = None
-  num_train_steps = None
-  num_warmup_steps = None
+  train_examples_sz = processor.train_sz
+  num_train_steps = int(
+      train_examples_sz / FLAGS.batch_size * FLAGS.num_train_epochs)
+  num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
 
   model_fn = model_fn_builder(
       bert_config=bert_config,
@@ -752,38 +809,8 @@ def main(_):
   if FLAGS.do_data:
     file_based_convert_examples_to_features(
         processor, label_list, FLAGS.max_seq_length, tokenizer, FLAGS.output_dir)
-    def _test_extract(record):
-      print(record, type(record))
-      seq_length = 128
-      name_to_context_features = {
-        "original" : tf.FixedLenFeature([], tf.string),
-        "trimmed" : tf.FixedLenFeature([], tf.string),
-        "len" : tf.FixedLenFeature([], tf.int64)
-      }
-
-      name_to_sequence_features = {
-        "input_ids": tf.FixedLenSequenceFeature([seq_length], tf.int64),
-        "input_mask": tf.FixedLenSequenceFeature([seq_length], tf.int64),
-        "segment_ids": tf.FixedLenSequenceFeature([seq_length], tf.int64),
-        "label_ids": tf.FixedLenSequenceFeature([], tf.int64),
-        "is_real_example": tf.FixedLenSequenceFeature([], tf.int64),
-        "query": tf.FixedLenSequenceFeature([], tf.string),
-        "qcnt": tf.FixedLenSequenceFeature([], tf.int64),
-      }
-
-      context, sequence = tf.parse_single_sequence_example(record, 
-        context_features = name_to_context_features,
-        sequence_features = name_to_sequence_features)
-      examples = []
-      for i in range(context["len"]):
-        example = {}
-        example["input_ids"] = sequence["input_ids"][i,:]
-        example["query"] = sequence["query"][i]
-      return examples
     reader = tf.TFRecordReader()
     filename_queue = tf.train.string_input_producer([os.path.join(FLAGS.output_dir, "train.tf_record")], num_epochs=1, shuffle=True)
-    key, record_string = reader.read(filename_queue)
-    data_record = _test_extract(record_string)
     with tf.Session() as sess:
       sess.run(
           tf.variables_initializer(
@@ -793,21 +820,25 @@ def main(_):
       # Start queue runners
       coord = tf.train.Coordinator()
       threads = tf.train.start_queue_runners(sess=sess, coord=coord)
+      key, record_string = reader.read(filename_queue)
+      record_string = sess.run(record_string)
+      data_record = _extract_examples(record_string, FLAGS.batch_size, FLAGS.max_seq_length)
       examples = sess.run(data_record)
-      print(examples)
+      for k, f in examples.items():
+        if hasattr(f, "shape"):
+          print("feature {} has content {} with shape {}".format(k, f, f.shape))
+        else:
+          print("feature {} has content {}".format(k, f))
 
   if FLAGS.do_train:
-    train_examples_sz = processor.train_sz
-    num_train_steps = int(
-        train_examples_sz / FLAGS.train_batch_size * FLAGS.num_train_epochs)
-    num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
     train_file = os.path.join(FLAGS.output_dir, "train.tf_record")
     tf.logging.info("***** Running training *****")
     tf.logging.info("  Num examples = %d", train_examples_sz)
-    tf.logging.info("  Batch size = %d", FLAGS.train_batch_size)
+    tf.logging.info("  Batch size = %d", FLAGS.batch_size)
     tf.logging.info("  Num steps = %d", num_train_steps)
     train_input_fn = file_based_input_fn_builder(
         input_file=train_file,
+        batch_size=FLAGS.batch_size,
         seq_length=FLAGS.max_seq_length,
         is_training=True,
         drop_remainder=True)
@@ -818,7 +849,7 @@ def main(_):
     eval_file = os.path.join(FLAGS.output_dir, "eval.tf_record")
 
     tf.logging.info("***** Running evaluation *****")
-    tf.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
+    tf.logging.info("  Batch size = %d", FLAGS.batch_size)
 
     # This tells the estimator to run through the entire set.
     eval_steps = None
@@ -826,6 +857,7 @@ def main(_):
     eval_drop_remainder = False
     eval_input_fn = file_based_input_fn_builder(
         input_file=eval_file,
+        batch_size = FLAGS.batch_size,
         seq_length=FLAGS.max_seq_length,
         is_training=False,
         drop_remainder=eval_drop_remainder)
@@ -845,11 +877,12 @@ def main(_):
     predict_file = os.path.join(FLAGS.output_dir, "predict.tf_record")
 
     tf.logging.info("***** Running prediction*****")
-    tf.logging.info("  Batch size = %d", FLAGS.predict_batch_size)
+    tf.logging.info("  Batch size = %d", FLAGS.batch_size)
 
     predict_drop_remainder = False
     predict_input_fn = file_based_input_fn_builder(
         input_file=predict_file,
+        batch_size = FLAGS.batch_size,
         seq_length=FLAGS.max_seq_length,
         is_training=False,
         drop_remainder=predict_drop_remainder)
