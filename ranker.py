@@ -172,7 +172,7 @@ class InputFeatures(object):
     self.is_real_example = is_real_example
 
 
-class AutoCompleteProcessor(Object):
+class AutoCompleteProcessor(object):
   def __init__(self, data_dir=FLAGS.data_dir):
     self.language = "en"
     self.train_test_split()
